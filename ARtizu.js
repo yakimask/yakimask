@@ -2,6 +2,7 @@
 const THRESHOLD_DISTANCE = 5; // ピンを消す（次のピンを表示する）しきい値距離 (メートル)
 const PIN_MODEL_SCALE = '0.5 0.5 0.5'; // ピンの3Dモデルのスケール
 const PIN_HEIGHT_OFFSET = 1; // 地面からのピンの高さ調整 (メートル)
+const UPDATE_INTERVAL_MS = 100; // ARピンの更新間隔 (ミリ秒)
 
 // ====== グローバル変数 ======
 let userLatitude = null;
@@ -15,6 +16,8 @@ const arPinsContainer = document.querySelector('#ar-pins-container');
 const currentLocationSpan = document.querySelector('#current-location');
 const destinationInfoSpan = document.querySelector('#destination-info');
 const messagePanel = document.querySelector('#message');
+
+let updateARPinsTimeout = null; // スロットリング用タイマー
 
 // ====== ヘルパー関数 ======
 
@@ -59,6 +62,37 @@ function calculateBearing(p1, p2) {
     return bearing;
 }
 
+/**
+ * 緯度経度差をメートルに変換するヘルパー (現在の緯度に基づいて経度方向のスケールを調整)
+ * @param {number} lat1 - ユーザーの緯度
+ * @param {number} lon1 - ユーザーの経度
+ * @param {number} lat2 - ピンの緯度
+ * @param {number} lon2 - ピンの経度
+ * @returns {object} {deltaX, deltaZ} X(東西)方向、Z(南北)方向のメートル差
+ */
+function latLonToMeters(lat1, lon1, lat2, lon2) {
+    const R = 6371e3; // 地球の半径 (メートル)
+
+    // 緯度1度あたりのメートル
+    const latToMeter = R * (Math.PI / 180);
+
+    // 経度1度あたりのメートル (平均緯度で調整)
+    const avgLatRad = ((lat1 + lat2) / 2) * Math.PI / 180;
+    const lonToMeter = R * Math.cos(avgLatRad) * (Math.PI / 180);
+
+    const deltaLatMeters = (lat2 - lat1) * latToMeter;
+    const deltaLonMeters = (lon2 - lon1) * lonToMeter;
+
+    // deltaXは東西方向、deltaZは南北方向
+    // AR.jsのZ軸は奥が負なので、南北方向の差をZ軸にマッピング
+    // AR.jsのX軸は右が正なので、東西方向の差をX軸にマッピング
+    return {
+        deltaX: deltaLonMeters,
+        deltaZ: deltaLatMeters
+    };
+}
+
+
 // ====== 位置情報・方位センサーの取得 ======
 
 // GPS (Geolocation API)
@@ -69,16 +103,29 @@ function initGeolocation() {
                 userLatitude = position.coords.latitude;
                 userLongitude = position.coords.longitude;
                 currentLocationSpan.textContent = `緯度: ${userLatitude.toFixed(6)}, 経度: ${userLongitude.toFixed(6)}`;
-                updateARPins(); // 位置が更新されたらARピンを更新
+                scheduleARPinsUpdate(); // 位置が更新されたらARピンの更新をスケジュール
             },
             (error) => {
                 console.error('Geolocation error:', error);
-                messagePanel.textContent = '位置情報の取得に失敗しました。GPSをオンにしてください。';
+                switch(error.code) {
+                    case error.PERMISSION_DENIED:
+                        messagePanel.textContent = '位置情報の利用が許可されていません。ブラウザの設定で位置情報のアクセスを許可してください。';
+                        break;
+                    case error.POSITION_UNAVAILABLE:
+                        messagePanel.textContent = '位置情報が利用できません。電波の良い場所へ移動するか、GPSがオンになっているか確認してください。';
+                        break;
+                    case error.TIMEOUT:
+                        messagePanel.textContent = '位置情報の取得がタイムアウトしました。電波の良い場所へ移動するか、再度お試しください。';
+                        break;
+                    case error.UNKNOWN_ERROR:
+                        messagePanel.textContent = '不明なエラーが発生しました。';
+                        break;
+                }
             },
             {
                 enableHighAccuracy: true,
                 maximumAge: 0,
-                timeout: 5000
+                timeout: 10000 // タイムアウトを少し長く設定
             }
         );
     } else {
@@ -89,29 +136,52 @@ function initGeolocation() {
 // DeviceOrientation (方位センサー)
 function initDeviceOrientation() {
     if (window.DeviceOrientationEvent) {
-        window.addEventListener('deviceorientationabsolute', (event) => {
-            // alpha: Z軸周りの回転（方位）。北が0度、東が90度、南が180度、西が270度
-            if (event.alpha !== null) {
-                userHeading = 360 - event.alpha; // AR.jsの座標系に合わせるため反転
-                // console.log("User Heading:", userHeading.toFixed(2));
-                updateARPins(); // 方位が更新されたらARピンを更新
-            }
-        }, true);
+        // iOS 13+ での許可要求
+        if (typeof DeviceOrientationEvent.requestPermission === 'function') {
+            DeviceOrientationEvent.requestPermission()
+                .then(permissionState => {
+                    if (permissionState === 'granted') {
+                        window.addEventListener('deviceorientationabsolute', handleDeviceOrientation, true);
+                    } else {
+                        messagePanel.textContent = '方位センサーの利用が許可されませんでした。AR体験が制限されます。';
+                    }
+                })
+                .catch(console.error);
+        } else {
+            // その他のブラウザ (Android Chromeなど)
+            window.addEventListener('deviceorientationabsolute', handleDeviceOrientation, true);
+        }
     } else {
-        messagePanel.textContent = 'お使いのデバイスは方位センサーをサポートしていません。';
+        messagePanel.textContent = 'お使いのデバイスは方位センサーをサポートしていません。方位に基づくピンの向きは利用できません。';
+    }
+}
+
+function handleDeviceOrientation(event) {
+    if (event.alpha !== null) {
+        // alpha: Z軸周りの回転（方位）。北が0度、東が90度、南が180度、西が270度
+        // AR.jsの座標系に合わせるため反転 (北を0度として時計回りが正、カメラのZ軸負方向が前方)
+        // デバイスのセンサーによってalpha値の挙動が異なる場合があるため、テストしながら調整
+        userHeading = 360 - event.alpha;
+        // console.log("User Heading:", userHeading.toFixed(2));
+        scheduleARPinsUpdate(); // 方位が更新されたらARピンの更新をスケジュール
     }
 }
 
 // ====== ARピンの表示ロジック ======
 
+// スロットリング関数
+function scheduleARPinsUpdate() {
+    if (updateARPinsTimeout === null) {
+        updateARPinsTimeout = setTimeout(() => {
+            updateARPins();
+            updateARPinsTimeout = null;
+        }, UPDATE_INTERVAL_MS);
+    }
+}
+
 function updateARPins() {
     if (userLatitude === null || userLongitude === null || pinsData.length === 0) {
         return; // 位置情報が未取得、またはピンデータがない場合は何もしない
-    }
-
-    // 古いピンをすべて削除
-    while (arPinsContainer.firstChild) {
-        arPinsContainer.removeChild(arPinsContainer.firstChild);
     }
 
     // 現在案内中のピンの情報を取得
@@ -119,7 +189,12 @@ function updateARPins() {
     if (!currentPin) {
         messagePanel.textContent = '目的地に到着しました！';
         destinationInfoSpan.textContent = 'イベント会場';
-        return; // 全てのピンを案内し終えた
+        // 全てのピンを案内し終えたら、ARピンを削除
+        const existingPin = document.querySelector('#current-ar-pin');
+        if (existingPin) {
+            existingPin.remove();
+        }
+        return;
     }
 
     destinationInfoSpan.textContent = currentPin.name;
@@ -146,30 +221,52 @@ function updateARPins() {
     // AR空間におけるピンのXYZ座標を計算
     // 北を基準とした方位とユーザーの向きを考慮
     // AR.jsのカメラは通常Y軸が上方向
-    // 緯度経度からメートルへの変換は簡略化（あくまで相対的な位置関係）
-    // 緯度1度あたり約111km, 経度1度あたり緯度によって異なるが約90km (日本付近)
-    const latDiffMeters = (currentPin.latitude - userLatitude) * 111139; // 約111km/度
-    const lonDiffMeters = (currentPin.longitude - userLongitude) * 96486; // 日本付近の経度1度あたりの距離の目安 (約96km/度)
+    
+    // 緯度経度差からメートルへの変換
+    const { deltaX, deltaZ } = latLonToMeters(
+        userLatitude, userLongitude,
+        currentPin.latitude, currentPin.longitude
+    );
 
-    // Three.js (A-Frame) のZ軸は奥方向、X軸は右方向
+    // Three.js (A-Frame) のZ軸は奥方向が負、X軸は右方向が正
     // ユーザーの現在位置と向きに基づいて相対的な位置を計算
-    const angleRad = (bearing - userHeading) * Math.PI / 180; // ピンへの方向 - ユーザーの向き
+    // bearing: 目的地への方位 (北0, 時計回り)
+    // userHeading: ユーザーの向いている方位 (北0, 時計回り)
 
-    const x = distance * Math.sin(angleRad); // X軸方向 (右/左)
-    const z = -distance * Math.cos(angleRad); // Z軸方向 (奥/手前)
+    // ピンがユーザーから見て相対的にどの方向にあるかを角度で示す (ラジアン)
+    // bearing - userHeading でユーザーの正面から見た相対角度を計算
+    // Math.sinでX軸成分、Math.cosでZ軸成分を計算
+    const angleFromUserToPinRad = (bearing - userHeading) * Math.PI / 180;
+
+    // AR空間での相対座標
+    // AR.jsのワールド座標系は、通常、カメラの初期位置が(0,0,0)で、カメラのZ軸が奥方向（負）
+    // よって、目的地がカメラの「前方」にあるように計算
+    const x = distance * Math.sin(angleFromUserToPinRad); // X軸方向 (右が正)
+    const z = -distance * Math.cos(angleFromUserToPinRad); // Z軸方向 (奥が負)
 
     const y = PIN_HEIGHT_OFFSET; // 地面からの高さ
 
-    // ARピンのエンティティを作成し、コンテナに追加
-    const pinEntity = document.createElement('a-entity');
-    pinEntity.setAttribute('gltf-model', '#pin-model');
-    pinEntity.setAttribute('position', `${x} ${y} ${z}`);
-    pinEntity.setAttribute('scale', PIN_MODEL_SCALE);
-    // ピンの向きをユーザーの方向に向ける（または進行方向に向ける）
-    // ユーザーからピンへの向きにピンの正面が向くように調整
-    pinEntity.setAttribute('rotation', `0 ${-angleRad * 180 / Math.PI + 180} 0`); // 向き調整
+    // ARピンのエンティティを既存のもので更新、または新規作成
+    let pinEntity = document.querySelector('#current-ar-pin');
+    if (!pinEntity) {
+        pinEntity = document.createElement('a-entity');
+        pinEntity.setAttribute('id', 'current-ar-pin'); // 一意のIDを設定
+        pinEntity.setAttribute('gltf-model', '#pin-model');
+        pinEntity.setAttribute('scale', PIN_MODEL_SCALE);
+        arPinsContainer.appendChild(pinEntity);
+    }
 
-    arPinsContainer.appendChild(pinEntity);
+    // 位置と回転を設定
+    pinEntity.setAttribute('position', `${x} ${y} ${z}`);
+
+    // ピンの向きをユーザーの方向に向ける（または進行方向に向ける）
+    // gltfモデルのデフォルトの向きによって調整が必要
+    // 例えば、モデルがZ軸負方向を正面としている場合、ユーザーから見てピンの正面をユーザーに向けるには
+    // (bearing - userHeading) + 180 度回転させる必要がある場合が多い。
+    // ここでは、ユーザーの正面に対してピンの正面が向くように調整を試みます。
+    // -angleFromUserToPinRad は、ユーザーの向きから見てピンがある方向。
+    // +180 はモデルの正面をユーザーに向けるための一般的なオフセット。
+    pinEntity.setAttribute('rotation', `0 ${(-angleFromUserToPinRad * 180 / Math.PI) + 180} 0`);
 }
 
 // ====== 初期化 ======
@@ -182,18 +279,19 @@ document.addEventListener('DOMContentLoaded', () => {
     if (eventId) {
         // ここで実際のイベントデータとピンの経路データを読み込む
         // 仮データ (実際にはサーバーから取得するなど)
+        // 日本（八王子）近辺の座標に変更
         switch (eventId) {
             case 'bungaku':
                 pinsData = [
-                    { name: '文学部棟入口', latitude: 35.8576, longitude: 139.7523 }, // 例：東京ドーム付近
-                    { name: '文学部棟2階教室', latitude: 35.8579, longitude: 139.7525 },
-                    { name: '文学部イベント会場', latitude: 35.8582, longitude: 139.7527 }
+                    { name: '中央大学多摩キャンパス正門', latitude: 35.617937, longitude: 139.423984 },
+                    { name: '文学部棟入口', latitude: 35.618600, longitude: 139.425500 },
+                    { name: '文学部イベント会場 (教室)', latitude: 35.619100, longitude: 139.426000 }
                 ];
                 break;
             case 'setsumeikai':
                 pinsData = [
-                    { name: '△△ホール入口', latitude: 35.8560, longitude: 139.7510 },
-                    { name: '△△ホール会場', latitude: 35.8563, longitude: 139.7512 }
+                    { name: 'Cスクエア入口', latitude: 35.617500, longitude: 139.423000 },
+                    { name: '△△ホール会場', latitude: 35.617800, longitude: 139.423300 }
                 ];
                 break;
             // 他のイベントのピンデータもここに追加
@@ -204,16 +302,15 @@ document.addEventListener('DOMContentLoaded', () => {
         currentDestinationPinIndex = 0; // 最初のピンから案内を開始
         destinationInfoSpan.textContent = pinsData[0].name;
 
-        initGeolocation();
-        initDeviceOrientation();
-        messagePanel.textContent = '位置情報を取得しています...';
+        // A-Frameシーンが完全にロードされてから位置情報と方位センサーを初期化
+        document.querySelector('a-scene').addEventListener('loaded', () => {
+            console.log('A-Frame scene loaded. Initializing sensors...');
+            initGeolocation();
+            initDeviceOrientation();
+            messagePanel.textContent = '位置情報を取得しています...';
+        });
 
     } else {
-        messagePanel.textContent = 'イベントが指定されていません。';
+        messagePanel.textContent = 'イベントが指定されていません。URLに ?event=bungaku または ?event=setsumeikai を追加してください。';
     }
-});
-
-// A-Frameシーンがロードされた後の処理（必要であれば）
-document.querySelector('a-scene').addEventListener('loaded', () => {
-    console.log('A-Frame scene loaded.');
 });
